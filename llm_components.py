@@ -138,9 +138,12 @@ class LLMSurrogate:
 
         # 解析回应
         match = re.search(r"\d+", content)
-        if not match: return None
+        if not match:
+            return None
 
         best_index = int(match.group())
-        if not (1 <= best_index <= len(candidate_points)): return None
+        if not (1 <= best_index <= len(candidate_points)):
+            return None
 
         return candidate_points[best_index - 1]
+
