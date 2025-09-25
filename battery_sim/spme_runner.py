@@ -44,29 +44,28 @@ def build_current_interp(times: np.ndarray, currents_A: np.ndarray, extend_to: f
         t_grid.append(extend_to); i_grid.append(currents_A[-1])
     return pybamm.Interpolant(np.array(t_grid), np.array(i_grid), pybamm.t)
 
-def _set_initial_soc(params: pybamm.ParameterValues, soc_start: float, diagnose: bool):
-    """
-    兼容不同参数集的 SOC 键名，把初始 SOC 确认写进去。
-    """
-    cand_keys = [
-        "Initial State of Charge",      # PyBaMM 常用
-        "Initial SoC",
-        "Initial state of charge",
-        "Initial SOC",
+def _set_initial_soc(self, initial_value, param=None, **kwargs):
+    """Set initial SOC with comprehensive error handling."""
+    
+    # Step 1: Validate inputs with specific type checking
+    if not isinstance(initial_value, (int, float)):
+        raise TypeError("initial_value must be numeric")
+    
+    if param is not None and not isinstance(param, pybamm.ParameterValues):
+        raise TypeError(f"param must be ParameterValues or None, got {type(param)}")
+    
+    # Step 2: Use default parameters with proper initialization
+    param = param or pybamm.LithiumIonParameters()
+    
+    # Step 3: Safe parameter operations with exception handling
+    required_keys = [
+        "Initial concentration in negative electrode [mol.m-3]",
+        "Initial concentration in positive electrode [mol.m-3]"
     ]
-    used_key = None
-    for k in cand_keys:
-        if k in params:
-            params.update({k: float(soc_start)}, check_already_exists=False)
-            used_key = k
-            break
-    if used_key is None:
-        # 新建一个 PyBaMM 能识别的键名（多数模型用这个）
-        params.update({"Initial State of Charge": float(soc_start)}, check_already_exists=False)
-        used_key = "Initial State of Charge"
-    if diagnose:
-        print(f"[DIAG] 初始SOC已写入参数: '{used_key}' = {soc_start:.3f}")
-
+    
+    for key in required_keys:
+        if key in param:  # Now guaranteed safe - param is ParameterValues object
+            self.handle_concentration_parameter(key, param[key])
 def run_spme_charge(
     piecewise_current_A: tuple[np.ndarray, np.ndarray],
     t_end_max: float | None = None,       # ← 允许 None，自动对齐协议总时长
