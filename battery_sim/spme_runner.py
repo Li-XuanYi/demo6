@@ -44,28 +44,58 @@ def build_current_interp(times: np.ndarray, currents_A: np.ndarray, extend_to: f
         t_grid.append(extend_to); i_grid.append(currents_A[-1])
     return pybamm.Interpolant(np.array(t_grid), np.array(i_grid), pybamm.t)
 
-def _set_initial_soc(self, initial_value, param=None, **kwargs):
+def set_initial_soc(params, soc_initial: float, diagnose: bool = False):
     """Set initial SOC with comprehensive error handling."""
+    if diagnose:
+        print(f"[DIAG] Setting initial SOC to {soc_initial}")
     
-    # Step 1: Validate inputs with specific type checking
-    if not isinstance(initial_value, (int, float)):
-        raise TypeError("initial_value must be numeric")
+    # Validate inputs
+    if not isinstance(soc_initial, (int, float)):
+        raise TypeError("soc_initial must be numeric")
     
-    if param is not None and not isinstance(param, pybamm.ParameterValues):
-        raise TypeError(f"param must be ParameterValues or None, got {type(param)}")
+    if not (0.0 <= soc_initial <= 1.0):
+        raise ValueError(f"soc_initial must be between 0 and 1, got {soc_initial}")
     
-    # Step 2: Use default parameters with proper initialization
-    param = param or pybamm.LithiumIonParameters()
+    # Get the nominal capacity
+    try:
+        Q_n = params["Nominal cell capacity [A.h]"]
+        if diagnose:
+            print(f"[DIAG] Nominal capacity: {Q_n} A.h")
+    except KeyError:
+        raise KeyError("Could not find 'Nominal cell capacity [A.h]' in parameters")
     
-    # Step 3: Safe parameter operations with exception handling
-    required_keys = [
-        "Initial concentration in negative electrode [mol.m-3]",
-        "Initial concentration in positive electrode [mol.m-3]"
-    ]
+    # Calculate stoichiometry values for the given SOC
+    # These are typical values for lithium-ion batteries
+    # At SOC=0: x_n ≈ 0.01, x_p ≈ 0.99
+    # At SOC=1: x_n ≈ 0.99, x_p ≈ 0.01
     
-    for key in required_keys:
-        if key in param:  # Now guaranteed safe - param is ParameterValues object
-            self.handle_concentration_parameter(key, param[key])
+    # Negative electrode stoichiometry (increases with SOC)
+    x_n_0 = 0.01 + (0.99 - 0.01) * soc_initial
+    x_n_100 = 0.01
+    
+    # Positive electrode stoichiometry (decreases with SOC)
+    x_p_0 = 0.99 - (0.99 - 0.01) * soc_initial  
+    x_p_100 = 0.99
+    
+    if diagnose:
+        print(f"[DIAG] Calculated stoichiometries: x_n={x_n_0:.3f}, x_p={x_p_0:.3f}")
+    
+    # Set the stoichiometry parameters
+    try:
+        params.update({
+            "Initial concentration in negative electrode [mol.m-3]": 
+                params["Maximum concentration in negative electrode [mol.m-3]"] * x_n_0,
+            "Initial concentration in positive electrode [mol.m-3]":
+                params["Maximum concentration in positive electrode [mol.m-3]"] * x_p_0
+        })
+        if diagnose:
+            print("[DIAG] Successfully updated initial concentrations")
+    except KeyError as e:
+        raise KeyError(f"Could not find required concentration parameters: {e}")
+    
+    if diagnose:
+        print(f"[DIAG] Initial SOC set successfully to {soc_initial}")
+
 def run_spme_charge(
     piecewise_current_A: tuple[np.ndarray, np.ndarray],
     t_end_max: float | None = None,       # ← 允许 None，自动对齐协议总时长
@@ -84,9 +114,12 @@ def run_spme_charge(
     # PyBaMM 充电约定：放电为正，充电为负
     current_fun = build_current_interp(t_knots, -np.abs(I_segments),
                                        extend_to=t_knots[-1] if t_end_max is None else t_end_max)
-    # ★★ 先把初始 SOC 用正确的键名写进去，然后再 process_model
+    
+    # Set current function
     params.update({"Current function [A]": current_fun}, check_already_exists=False)
-    _set_initial_soc(params, soc_start, diagnose=diagnose)
+    
+    # Set initial SOC using the fixed function
+    set_initial_soc(params, soc_start, diagnose=diagnose)
 
     geometry = model.default_geometry
     params.process_model(model)
@@ -160,6 +193,7 @@ def run_spme_charge(
 
     return ChargeResult(feasible, reason, res_t, res_V, res_T, res_I, res_soc, res_aging,
                         t_final, T_peak, aging_final)
+
 def debug_run(j_segments_Apm2=None, seg_duration_s: float = 600.0):
     """
     调试函数：用给定的分段电流密度跑一次仿真。
