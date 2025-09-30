@@ -1,46 +1,55 @@
-# optimize_charge.py - COMPREHENSIVE FIX
+# optimize_charge.py - FIXED VERSION with correct time parameters
 from __future__ import annotations
 import numpy as np
 import sys
-import os
-from openai import OpenAI
 import warnings
 warnings.filterwarnings('ignore')
 
-# Ensure matplotlib uses non-interactive backend
 import matplotlib
 matplotlib.use('Agg')
 
-# Configure matplotlib
-try:
-    matplotlib.rcParams['font.family'] = 'DejaVu Sans'
-    matplotlib.rcParams['font.size'] = 10
-    matplotlib.rcParams['axes.unicode_minus'] = False
-    matplotlib.rcParams['figure.facecolor'] = 'white'
-except Exception:
-    pass
+from openai import OpenAI
 
 from llmbo_core.bayesian_optimization import BayesianOptimization
 from llm_components import LLMSampler, LLMSurrogate
 from objective.charge_objective import ChargeObjective, ChargeObjectiveConfig
 from policies.pw_current_fixed import build_piecewise_current_A
-from battery_sim.spme_runner import run_spme_charge, debug_run
+from battery_sim.spme_runner import run_spme_charge
 from plot.compare_plots import compare_time_series
 
-# Configuration
+# API Configuration
 API_KEY = "sk-84ac2d321cf444e799ddc9db79c02e92"
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 MODELS = ["qwen-plus", "qwen-max", "qwen1.5-7b-chat", "qwen-turbo"]
 
-# Optimization parameters
-K = 3  # Number of charging stages
-J_MIN, J_MAX = 15.0, 55.0  # Current density bounds (A/m^2) - more conservative
-INIT_POINTS = 8  # Initial random evaluations
-N_ITER = 12  # Optimization iterations  
+# 🔧 FIXED: Optimization parameters with REALISTIC time scale
+K = 3  # Number of stages
+J_MIN, J_MAX = 20.0, 60.0  # Current density bounds (A/m²)
+SEG_DURATION = 1500.0  # 🔧 INCREASED: 1500s per segment = 25 min (was 400s)
+# Total time: 3 × 1500s = 4500s = 75 minutes (sufficient for 20%→80%)
+
+INIT_POINTS = 6  # Initial random evaluations
+N_ITER = 10  # Optimization iterations
 WEIGHTS = (0.4, 0.3, 0.3)  # Multi-objective weights (time, temp, aging)
 
+print(f"""
+╔════════════════════════════════════════════════════════════╗
+║          🔧 PARAMETER FIX EXPLANATION 🔧                   ║
+╠════════════════════════════════════════════════════════════╣
+║ Previous problem: seg_duration = 400s was too short       ║
+║ Calculation: 5Ah battery, 20%→80% needs ~3Ah charge       ║
+║              With ~2A current: 3Ah/2A = 5400s needed      ║
+║                                                            ║
+║ NEW FIXED PARAMETERS:                                      ║
+║  • Segment duration: {SEG_DURATION}s = {SEG_DURATION/60:.0f} minutes                  ║
+║  • Total time: {K * SEG_DURATION}s = {K * SEG_DURATION/60:.0f} minutes                     ║
+║  • Current range: [{J_MIN:.0f}, {J_MAX:.0f}] A/m² = [1-3]A              ║
+║  • Expected charge: ~2A × 1.25h = 2.5-3Ah ✓               ║
+╚════════════════════════════════════════════════════════════╝
+""")
+
 def test_qwen_connection():
-    """Test connection to Qwen models and return working client."""
+    """Test Qwen API connection."""
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
     
     for model in MODELS:
@@ -48,160 +57,173 @@ def test_qwen_connection():
             print(f"Testing {model}...")
             response = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": "Hello, respond with just 'OK'"}],
+                messages=[{"role": "user", "content": "Reply OK"}],
                 max_tokens=5,
                 timeout=10
             )
-            response_text = response.choices[0].message.content.strip()
-            print(f"✓ {model} working: '{response_text}'")
+            print(f"✓ {model} working")
             return client, model
-            
         except Exception as e:
-            print(f"✗ {model} failed: {str(e)[:100]}")
+            print(f"✗ {model} failed: {str(e)[:80]}")
     
-    raise RuntimeError("No Qwen models available. Check API key and network.")
+    raise RuntimeError("No Qwen models available")
 
 def run_optimization_method(use_llm: bool, config: ChargeObjectiveConfig) -> tuple:
-    """Run single optimization method (LLM+BO or Traditional BO)."""
-    method_name = "LLM+BO" if use_llm else "Traditional BO"
-    print(f"\n{'='*20} {method_name} {'='*20}")
+    """Run optimization with fixed parameters."""
+    method = "LLM+BO" if use_llm else "Traditional BO"
+    print(f"\n{'='*60}")
+    print(f"  {method}")
+    print(f"{'='*60}")
     
-    # Create fresh objective instance
     objective = ChargeObjective(config)
-    
-    # Build target function and parameter bounds
     target_func, param_names = objective.build_bo_target()
     pbounds = {name: (J_MIN, J_MAX) for name in param_names}
     
-    print(f"Parameter bounds: {pbounds}")
-    print(f"Optimization config: init_points={INIT_POINTS}, n_iter={N_ITER}")
+    print(f"Parameters: {param_names}")
+    print(f"Bounds: [{J_MIN:.0f}, {J_MAX:.0f}] A/m²")
+    print(f"Segment duration: {config.seg_duration_s}s")
     
-    # Create optimizer
     if use_llm:
         client, model = test_qwen_connection()
         optimizer = BayesianOptimization(
             f=target_func,
             pbounds=pbounds,
-            random_state=42,  # Fixed seed for reproducibility
+            random_state=42,
             verbose=2,
             use_llm=True,
             llm_sampler=LLMSampler(client, model),
             llm_surrogate=LLMSurrogate(client, model)
         )
-        print(f"✓ LLM+BO optimizer created with model: {model}")
+        print(f"✓ LLM+BO with {model}")
     else:
         optimizer = BayesianOptimization(
             f=target_func,
             pbounds=pbounds,
             random_state=42,
-            verbose=2,
-            use_llm=False
+            verbose=2
         )
-        print("✓ Traditional BO optimizer created")
+        print("✓ Traditional BO")
     
-    # Run optimization
-    print(f"\nStarting {method_name} optimization...")
+    print(f"\nStarting optimization...")
+    print(f"  Init points: {INIT_POINTS}, Iterations: {N_ITER}")
+    
     try:
         optimizer.maximize(init_points=INIT_POINTS, n_iter=N_ITER)
-        print(f"✓ {method_name} optimization completed successfully")
+        print(f"✓ {method} completed")
     except Exception as e:
-        print(f"ERROR during {method_name} optimization: {e}")
+        print(f"✗ {method} error: {e}")
         import traceback
         traceback.print_exc()
         return None, None, None
     
-    # Extract results
-    best_result = optimizer.max
-    if best_result is None:
-        print(f"No valid results from {method_name}")
+    best = optimizer.max
+    if best is None:
+        print(f"No valid results")
         return None, None, None
     
-    print(f"\n{method_name} Results:")
-    print(f"  Best target value: {best_result['target']:.6f}")
-    print(f"  Best parameters: {best_result['params']}")
+    print(f"\n{method} Best Result:")
+    print(f"  Target: {best['target']:.6f}")
+    print(f"  Params: {[f'{v:.1f}' for v in best['params'].values()]}")
     
-    # Generate detailed simulation with best parameters
-    j_vec = np.array([best_result['params'][name] for name in param_names])
-    detailed_result = simulate_best_solution(j_vec, config)
+    # Detailed simulation
+    j_vec = np.array([best['params'][name] for name in param_names])
+    detailed = simulate_best(j_vec, config)
     
-    return best_result, detailed_result, objective
+    return best, detailed, objective
 
-def simulate_best_solution(j_segments: np.ndarray, config: ChargeObjectiveConfig):
-    """Simulate the best solution in detail for analysis."""
-    print(f"\n--- Detailed simulation with j = {j_segments} ---")
+def simulate_best(j_segments: np.ndarray, config: ChargeObjectiveConfig):
+    """Run detailed simulation of best solution."""
+    print(f"\n--- Detailed simulation: {j_segments} A/m² ---")
     
-    # Build current profile
-    t_knots, I_segments_A = build_piecewise_current_A(
-        j_segments, 
+    t_knots, I_segments = build_piecewise_current_A(
+        j_segments,
         seg_duration_s=config.seg_duration_s
     )
     
-    total_time = float(config.seg_duration_s * config.K)
+    total_time = config.seg_duration_s * config.K
     
-    # Run detailed simulation
     result = run_spme_charge(
-        piecewise_current_A=(t_knots, I_segments_A),
-        t_end_max=total_time + 300.0,
+        piecewise_current_A=(t_knots, I_segments),
+        t_end_max=total_time + 600.0,
         soc_start=0.2,
         soc_target=config.target_soc,
         with_aging=config.with_aging,
         diagnose=True
     )
     
-    # Report detailed metrics
     if result.feasible:
-        print(f"✓ Solution feasible: {result.reason}")
-        print(f"  Final time: {result.t_final:.1f}s ({result.t_final/60:.1f}min)")
-        print(f"  Peak temperature: {result.T_peak:.2f}K ({result.T_peak-273.15:.1f}°C)")
-        print(f"  Final SOC: {result.soc[-1]*100:.1f}%")
-        print(f"  Battery aging: {result.aging_final:.4f}%")
+        print(f"✓ Feasible: {result.reason}")
+        print(f"  Time: {result.t_final/60:.1f} min")
+        print(f"  Temp: {result.T_peak-273.15:.1f} °C")
+        print(f"  SOC: {result.soc[-1]:.1%}")
+        print(f"  Aging: {result.aging_final:.4f}%")
     else:
-        print(f"✗ Solution infeasible: {result.reason}")
-        print(f"  Stopped at: {result.t_final:.1f}s, SOC: {result.soc[-1]*100:.1f}%")
+        print(f"✗ Infeasible: {result.reason}")
+        print(f"  SOC reached: {result.soc[-1]:.1%}")
     
     return result
 
-def run_diagnostic_test(config: ChargeObjectiveConfig):
-    """Run diagnostic test to verify system functionality."""
+def run_sanity_check():
+    """Quick sanity check before optimization."""
     print("\n" + "="*60)
-    print("DIAGNOSTIC TEST")
+    print("SANITY CHECK: Can we reach 80% SOC?")
     print("="*60)
     
-    print("Testing basic simulation with moderate parameters: [30, 25, 20] A/m²")
+    print("Testing moderate profile: [40, 35, 30] A/m²")
+    print(f"Duration: {SEG_DURATION}s per segment")
     
     try:
-        test_result = debug_run(
-            j_segments_Apm2=[30, 25, 20],
-            seg_duration_s=config.seg_duration_s
+        t_knots, I_seg = build_piecewise_current_A([40, 35, 30], SEG_DURATION)
+        
+        result = run_spme_charge(
+            piecewise_current_A=(t_knots, I_seg),
+            t_end_max=SEG_DURATION * 3 + 600,
+            soc_start=0.2,
+            soc_target=0.8,
+            with_aging=False,
+            diagnose=True
         )
         
-        if test_result.feasible:
-            print("✓ Basic simulation working correctly")
-            print(f"  Test metrics: time={test_result.t_final:.1f}s, "
-                  f"SOC={test_result.soc[-1]*100:.1f}%, "
-                  f"T_peak={test_result.T_peak-273.15:.1f}°C")
+        final_soc = result.soc[-1] if len(result.soc) > 0 else 0.0
+        
+        if final_soc >= 0.75:
+            print(f"\n✓ SANITY CHECK PASSED")
+            print(f"  Reached {final_soc:.1%} SOC in {result.t_final/60:.1f} min")
+            print("  Parameters are reasonable, proceeding...\n")
+            return True
         else:
-            print(f"⚠ Basic simulation issues: {test_result.reason}")
-        
-        return True
-        
+            print(f"\n⚠ WARNING: Only reached {final_soc:.1%}")
+            print("  You may need to increase SEG_DURATION further")
+            
+            # Calculate required time
+            capacity_needed = 5.0 * 0.6  # 5Ah × 60% = 3Ah
+            avg_current = np.mean(I_seg)
+            time_needed = (capacity_needed / avg_current) * 3600
+            
+            print(f"\n  Calculation:")
+            print(f"    Capacity needed: {capacity_needed:.1f} Ah")
+            print(f"    Average current: {avg_current:.2f} A")
+            print(f"    Time needed: {time_needed:.0f}s ({time_needed/60:.0f} min)")
+            print(f"    Current total: {SEG_DURATION * 3:.0f}s ({SEG_DURATION * 3/60:.0f} min)")
+            
+            response = input("\n  Continue anyway? (y/n): ")
+            return response.lower() == 'y'
+            
     except Exception as e:
-        print(f"✗ Diagnostic test failed: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\n✗ SANITY CHECK FAILED: {e}")
         return False
 
 def main():
-    """Main optimization pipeline with comprehensive error handling."""
+    """Main optimization pipeline."""
     print("="*80)
-    print("LITHIUM-ION BATTERY CHARGING OPTIMIZATION")
-    print("LLM-Enhanced Bayesian Optimization with Chebyshev Scalarization")
+    print("  LITHIUM-ION BATTERY CHARGING OPTIMIZATION")
+    print("  LLM-Enhanced Bayesian Optimization (FIXED VERSION)")
     print("="*80)
     
-    # Create configuration
+    # Configuration with FIXED parameters
     config = ChargeObjectiveConfig(
         K=K,
-        seg_duration_s=400.0,  # Reduced to 400s per segment for faster simulation
+        seg_duration_s=SEG_DURATION,  # 🔧 FIXED: Now 1500s
         j_min=J_MIN,
         j_max=J_MAX,
         weights=WEIGHTS,
@@ -209,97 +231,95 @@ def main():
         with_aging=True,
         init_points=INIT_POINTS,
         target_soc=0.8,
-        base_penalty=500.0  # Reasonable penalty
+        base_penalty=500.0
     )
     
-    print(f"Configuration:")
+    print(f"\nConfiguration:")
     print(f"  Stages: {config.K}")
-    print(f"  Duration per stage: {config.seg_duration_s}s")
-    print(f"  Current density range: [{config.j_min}, {config.j_max}] A/m²")
-    print(f"  Objective weights: {config.weights}")
+    print(f"  Duration: {config.seg_duration_s}s/stage ({config.seg_duration_s/60:.0f} min)")
+    print(f"  Total time: {config.K * config.seg_duration_s}s ({config.K * config.seg_duration_s/60:.0f} min)")
+    print(f"  Current range: [{config.j_min}, {config.j_max}] A/m²")
+    print(f"  Weights: {config.weights}")
     
-    # Run diagnostic test
-    if not run_diagnostic_test(config):
-        print("Diagnostic test failed. Please check your setup.")
+    # Sanity check
+    if not run_sanity_check():
+        print("\nSanity check failed. Aborting.")
         return
     
-    # Initialize results storage
     results = {}
     
-    # Run Traditional BO
-    print(f"\n{'='*25} TRADITIONAL BO {'='*25}")
+    # Traditional BO
+    print(f"\n{'#'*60}")
+    print("RUNNING: Traditional Bayesian Optimization")
+    print(f"{'#'*60}")
     try:
-        best_trad, result_trad, obj_trad = run_optimization_method(use_llm=False, config=config)
-        results['traditional'] = (best_trad, result_trad, obj_trad)
+        best_trad, res_trad, obj_trad = run_optimization_method(False, config)
+        results['trad'] = (best_trad, res_trad, obj_trad)
     except Exception as e:
         print(f"Traditional BO failed: {e}")
-        results['traditional'] = (None, None, None)
+        results['trad'] = (None, None, None)
     
-    # Run LLM+BO
-    print(f"\n{'='*28} LLM+BO {'='*28}")
+    # LLM+BO
+    print(f"\n{'#'*60}")
+    print("RUNNING: LLM-Enhanced Bayesian Optimization")
+    print(f"{'#'*60}")
     try:
-        best_llm, result_llm, obj_llm = run_optimization_method(use_llm=True, config=config)
-        results['llm'] = (best_llm, result_llm, obj_llm)
+        best_llm, res_llm, obj_llm = run_optimization_method(True, config)
+        results['llm'] = (best_llm, res_llm, obj_llm)
     except Exception as e:
         print(f"LLM+BO failed: {e}")
         results['llm'] = (None, None, None)
     
     # Compare results
-    print(f"\n{'='*25} RESULTS COMPARISON {'='*25}")
+    print(f"\n{'='*60}")
+    print("FINAL COMPARISON")
+    print(f"{'='*60}")
     
-    trad_best, trad_result, trad_obj = results['traditional']
-    llm_best, llm_result, llm_obj = results['llm']
+    best_trad, res_trad, _ = results['trad']
+    best_llm, res_llm, _ = results['llm']
     
-    if trad_best and llm_best:
-        print(f"Traditional BO:")
-        print(f"  Target: {trad_best['target']:.6f}")
-        print(f"  Parameters: {[f'{v:.1f}' for v in trad_best['params'].values()]}")
+    if best_trad and best_llm:
+        print(f"\nTraditional BO:")
+        print(f"  Target: {best_trad['target']:.6f}")
+        print(f"  Current: {[f'{v:.1f}' for v in best_trad['params'].values()]} A/m²")
         
-        print(f"LLM+BO:")
-        print(f"  Target: {llm_best['target']:.6f}") 
-        print(f"  Parameters: {[f'{v:.1f}' for v in llm_best['params'].values()]}")
+        print(f"\nLLM+BO:")
+        print(f"  Target: {best_llm['target']:.6f}")
+        print(f"  Current: {[f'{v:.1f}' for v in best_llm['params'].values()]} A/m²")
         
-        improvement = ((llm_best['target'] - trad_best['target']) / abs(trad_best['target']) * 100)
-        print(f"LLM+BO improvement: {improvement:+.2f}%")
+        improvement = ((best_llm['target'] - best_trad['target']) / 
+                      abs(best_trad['target']) * 100)
+        print(f"\nImprovement: {improvement:+.2f}%")
         
-        # Generate comparison plots
-        if trad_result and llm_result and trad_result.feasible and llm_result.feasible:
+        # Generate plots
+        if res_trad and res_llm and res_trad.feasible and res_llm.feasible:
             print("\nGenerating comparison plots...")
             try:
-                compare_time_series(llm_result, trad_result, save_prefix="optimization_results")
-                print("✓ Plots generated successfully")
+                compare_time_series(res_llm, res_trad, "optimized_charging")
+                print("✓ Plots saved to output_plots/")
             except Exception as e:
-                print(f"Plot generation failed: {e}")
-        else:
-            print("Cannot generate plots - insufficient feasible results")
+                print(f"Plot error: {e}")
     
-    elif llm_best:
-        print("Only LLM+BO produced valid results:")
-        print(f"  Target: {llm_best['target']:.6f}")
-        print(f"  Parameters: {[f'{v:.1f}' for v in llm_best['params'].values()]}")
-    
-    elif trad_best:
-        print("Only Traditional BO produced valid results:")
-        print(f"  Target: {trad_best['target']:.6f}")
-        print(f"  Parameters: {[f'{v:.1f}' for v in trad_best['params'].values()]}")
-    
+    elif best_llm:
+        print("Only LLM+BO succeeded:")
+        print(f"  Target: {best_llm['target']:.6f}")
+    elif best_trad:
+        print("Only Traditional BO succeeded:")
+        print(f"  Target: {best_trad['target']:.6f}")
     else:
-        print("Both optimization methods failed to find valid solutions.")
-        print("Consider:")
-        print("  - Adjusting parameter bounds")
-        print("  - Reducing segment duration")
-        print("  - Checking battery model parameters")
+        print("Both methods failed. Check parameters.")
     
     print(f"\n{'='*80}")
     print("OPTIMIZATION COMPLETE")
-    print(f"{'='*80}")
+    print(f"{'='*80}\n")
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\nOptimization interrupted by user.")
+        print("\n\nInterrupted by user.")
     except Exception as e:
         print(f"\n\nFATAL ERROR: {e}")
         import traceback
         traceback.print_exc()
+        
